@@ -134,6 +134,7 @@ let rec transf_struct_members env id count = function
                   if !config.bitfields_msb_first
                   then sizeof_ikind carrier_ikind * 8 - pos - sz
                   else pos in
+                Debug.set_bitfield_offset id name pos carrier (sizeof_ikind carrier_ikind);
                 Hashtbl.add bitfield_table
                   (id, name)
                   {bf_carrier = carrier; bf_carrier_typ = carrier_typ;
@@ -190,12 +191,12 @@ let transf_composite env su id attr ml =
 (* Bitfield manipulation expressions *)
 
 let left_shift_count bf =
-  intconst 
+  intconst
     (Int64.of_int (8 * !config.sizeof_int - (bf.bf_pos + bf.bf_size)))
     IInt
 
 let right_shift_count bf =
-  intconst 
+  intconst
     (Int64.of_int (8 * !config.sizeof_int - bf.bf_size))
     IInt
 
@@ -302,7 +303,7 @@ let bitfield_initializer bf i =
 (* Associate to the left so that it prints more nicely *)
 
 let or_expr_list = function
-  | [] -> intconst 0L IUInt 
+  | [] -> intconst 0L IUInt
   | [e] -> e
   | e1 :: el ->
       List.fold_left
@@ -408,7 +409,7 @@ let rec transf_exp env ctx e =
       | Some(ex, bf) ->
           transf_post env ctx (op_for_incr_decr op) ex bf e1.etyp
       end
-  | EUnop(op, e1) -> 
+  | EUnop(op, e1) ->
       {edesc = EUnop(op, transf_exp env Val e1); etyp = e.etyp}
 
   | EBinop(Oassign, e1, e2, ty) ->
@@ -432,7 +433,7 @@ let rec transf_exp env ctx e =
           transf_assignop env ctx (op_for_assignop op) ex bf e2 ty
       end
   | EBinop(Ocomma, e1, e2, ty) ->
-      {edesc = EBinop(Ocomma, transf_exp env Effects e1, 
+      {edesc = EBinop(Ocomma, transf_exp env Effects e1,
                               transf_exp env Val e2, ty);
        etyp = e.etyp}
   | EBinop(op, e1, e2, ty) ->
@@ -501,7 +502,7 @@ and transf_post env ctx op e1 bf tyfield  =
 and transf_init env i =
   match i with
   | Init_single e -> Init_single (transf_exp env Val e)
-  | Init_array il -> Init_array (List.map (transf_init env) il)
+  | Init_array il -> Init_array (List.rev (List.rev_map (transf_init env) il))
   | Init_struct(id, fld_init_list) ->
       let fld_init_list' =
         List.map (fun (f, i) -> (f, transf_init env i)) fld_init_list in
@@ -533,5 +534,5 @@ let program p =
   Transform.program
     ~composite:transf_composite
     ~decl: transf_decl
-    ~fundef:transf_fundef 
+    ~fundef:transf_fundef
     p

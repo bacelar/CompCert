@@ -20,16 +20,14 @@ open Pre_parser_aux
 open Cabshelper
 open Camlcoq
 
-let contexts : string list list ref = ref []
-let lexicon : (string, Cabs.cabsloc -> token) Hashtbl.t = Hashtbl.create 0
+module SSet = Set.Make(String)
 
-let init filename channel : Lexing.lexbuf =
-  assert (!contexts = []);
-  Hashtbl.clear lexicon;
-  List.iter
-    (fun (key, builder) -> Hashtbl.add lexicon key builder)
-    [ 
-      ("_Alignas", fun loc -> ALIGNAS loc);
+let lexicon : (string, Cabs.cabsloc -> token) Hashtbl.t = Hashtbl.create 17
+let ignored_keyworkds : SSet.t ref = ref SSet.empty
+
+let () =
+  List.iter (fun (key, builder) -> Hashtbl.add lexicon key builder)
+    [ ("_Alignas", fun loc -> ALIGNAS loc);
       ("_Alignof", fun loc -> ALIGNOF loc);
       ("_Bool", fun loc -> UNDERSCORE_BOOL loc);
       ("__alignof", fun loc -> ALIGNOF loc);
@@ -84,38 +82,32 @@ let init filename channel : Lexing.lexbuf =
       ("unsigned", fun loc -> UNSIGNED loc);
       ("void", fun loc -> VOID loc);
       ("volatile", fun loc -> VOLATILE loc);
-      ("while", fun loc -> WHILE loc);
-    ];
+      ("while", fun loc -> WHILE loc)];
+  if Configuration.system <> "diab" then
+    (* We can ignore the __extension__ GCC keyword. *)
+    ignored_keyworkds := SSet.add "__extension__" !ignored_keyworkds
 
-  push_context := begin fun () -> contexts := []::!contexts end;
-  pop_context := begin fun () ->
-    match !contexts with
-      | [] -> assert false
-      | t::q -> List.iter (Hashtbl.remove lexicon) t;
-                contexts := q
+let init_ctx = SSet.singleton "__builtin_va_list"
+let types_context : SSet.t ref = ref init_ctx
+
+let _ =
+  (* See comments in pre_parser_aux.ml *)
+  save_context := begin fun () ->
+    let save = !types_context in
+    fun () -> types_context := save
   end;
 
- declare_varname := begin fun id ->
-   if Hashtbl.mem lexicon id then begin
-     Hashtbl.add lexicon id (fun loc -> VAR_NAME (id, ref VarId, loc));
-     match !contexts with
-       | [] -> ()
-       | t::q -> contexts := (id::t)::q
-     end
+  declare_varname := begin fun id ->
+    types_context := SSet.remove id !types_context
   end;
 
   declare_typename := begin fun id ->
-    Hashtbl.add lexicon id (fun loc -> TYPEDEF_NAME (id, ref TypedefId, loc));
-    match !contexts with
-      | [] -> ()
-      | t::q -> contexts := (id::t)::q
-  end;
+    types_context := SSet.add id !types_context
+  end
 
-  !declare_typename "__builtin_va_list";
-
+let init filename channel : Lexing.lexbuf =
   let lb = Lexing.from_channel channel in
-  lb.lex_curr_p <-
-    {lb.lex_curr_p with pos_fname = filename; pos_lnum = 1};
+  lb.lex_curr_p <- {lb.lex_curr_p with pos_fname = filename; pos_lnum = 1};
   lb
 
 let currentLoc =
@@ -280,15 +272,15 @@ rule initial = parse
                                       currentLoc lexbuf)}
   | preprocessing_number as s     { error lexbuf "invalid numerical constant '%s'@ These characters form a preprocessor number, but not a constant" s;
                                     CONSTANT (Cabs.CONST_INT "0", currentLoc lexbuf) }
-  | "'"                           { let l = char_literal [] lexbuf in
+  | "'"                           { let l = char_literal lexbuf.lex_start_p [] lexbuf in
                                     CONSTANT (Cabs.CONST_CHAR(false, l),
                                               currentLoc lexbuf) }
-  | "L'"                          { let l = char_literal [] lexbuf in
+  | "L'"                          { let l = char_literal lexbuf.lex_start_p [] lexbuf in
                                     CONSTANT (Cabs.CONST_CHAR(true, l),
                                               currentLoc lexbuf) }
-  | "\""                          { let l = string_literal [] lexbuf in
+  | "\""                          { let l = string_literal lexbuf.lex_start_p [] lexbuf in
                                     STRING_LITERAL(false, l, currentLoc lexbuf) }
-  | "L\""                         { let l = string_literal [] lexbuf in
+  | "L\""                         { let l = string_literal lexbuf.lex_start_p [] lexbuf in
                                     STRING_LITERAL(true, l, currentLoc lexbuf) }
   | "..."                         { ELLIPSIS(currentLoc lexbuf) }
   | "+="                          { ADD_ASSIGN(currentLoc lexbuf) }
@@ -337,8 +329,11 @@ rule initial = parse
   | ","                           { COMMA(currentLoc lexbuf) }
   | "."                           { DOT(currentLoc lexbuf) }
   | identifier as id              {
-        try Hashtbl.find lexicon id (currentLoc lexbuf)
-        with Not_found -> VAR_NAME (id, ref VarId, currentLoc lexbuf) }
+    if SSet.mem id !ignored_keyworkds then
+      initial lexbuf
+    else
+      try Hashtbl.find lexicon id (currentLoc lexbuf)
+      with Not_found -> PRE_NAME id }
   | eof                           { EOF }
   | _ as c                        { fatal_error lexbuf "invalid symbol %C" c }
 
@@ -373,15 +368,17 @@ and char = parse
   | _ as c
       { Int64.of_int (Char.code c) }
 
-and char_literal accu = parse
-  | '\''       { List.rev accu }
+and char_literal startp accu = parse
+  | '\''       { lexbuf.lex_start_p <- startp;
+                 List.rev accu }
   | '\n' | eof { fatal_error lexbuf "missing terminating \"'\" character" }
-  | ""         { let c = char lexbuf in char_literal (c :: accu) lexbuf }
+  | ""         { let c = char lexbuf in char_literal startp (c :: accu) lexbuf }
 
-and string_literal accu = parse
-  | '\"'       { List.rev accu }
+and string_literal startp accu = parse
+  | '\"'       { lexbuf.lex_start_p <- startp;
+                 List.rev accu }
   | '\n' | eof { fatal_error lexbuf "missing terminating '\"' character" }
-  | ""         { let c = char lexbuf in string_literal (c :: accu) lexbuf }
+  | ""         { let c = char lexbuf in string_literal startp (c :: accu) lexbuf }
 
 (* We assume gcc -E syntax but try to tolerate variations. *)
 and hash = parse
@@ -435,20 +432,68 @@ and singleline_comment = parse
   open Parser
   open Aut.GramDefs
 
-  let tokens_stream lexbuf : token coq_Stream =
-    let tokens = Queue.create () in
-    let lexer_wraper lexbuf : Pre_parser.token =
-      let res =
-        if lexbuf.lex_curr_p.pos_cnum = lexbuf.lex_curr_p.pos_bol then
-          initial_linebegin lexbuf
-        else
-          initial lexbuf
-      in
-      Queue.push res tokens;
-      res
+  (* This is the main entry point to the lexer. *)
+
+  let lexer : lexbuf -> Pre_parser.token =
+    fun lexbuf ->
+      if lexbuf.lex_curr_p.pos_cnum = lexbuf.lex_curr_p.pos_bol then
+        initial_linebegin lexbuf
+      else
+        initial lexbuf
+
+  (* [lexer tokens buffer] is a new lexer, which wraps [lexer], and also: 1-
+     records the token stream into the FIFO queue [tokens] and 2- records the
+     start and end positions of the last two tokens in the two-place buffer
+     [buffer] and 3- duplicates identifier tokens into PRE_NAME and
+     VAR/TYPE_NAME. *)
+
+  let lexer tokens buffer : lexbuf -> Pre_parser.token =
+    let curr_id = ref None in
+    types_context := init_ctx;
+    fun lexbuf ->
+      match !curr_id with
+      | Some id ->
+        curr_id := None;
+        let loc = currentLoc lexbuf in
+        let token =
+          if SSet.mem id !types_context then TYPEDEF_NAME (id, ref TypedefId, loc)
+          else VAR_NAME (id, ref VarId, loc)
+        in
+        Queue.push token tokens;
+        token
+      | None ->
+        let token = lexer lexbuf in
+        begin match token with
+        | PRE_NAME id -> curr_id := Some id
+        | _ -> Queue.push token tokens
+        end;
+        let startp = lexbuf.lex_start_p
+        and endp = lexbuf.lex_curr_p in
+        buffer := ErrorReports.update !buffer (startp, endp);
+        token
+
+  (* [invoke_pre_parser] is in charge of calling the pre_parser. It uses
+     the incremental API, which allows us to do our own error handling. *)
+
+  let invoke_pre_parser filename text lexer buffer =
+    let lexbuf = Lexing.from_string text in
+    lexbuf.lex_curr_p <- {lexbuf.lex_curr_p with pos_fname = filename; pos_lnum = 1};
+    let module I = Pre_parser.MenhirInterpreter in
+    let checkpoint = Pre_parser.Incremental.translation_unit_file lexbuf.lex_curr_p
+    and supplier = I.lexer_lexbuf_to_supplier lexer lexbuf
+    and succeed () = ()
+    and fail checkpoint =
+      Cerrors.fatal_error_raw "%s" (ErrorReports.report text !buffer checkpoint)
     in
-    Pre_parser.translation_unit_file lexer_wraper lexbuf;
-    assert (!contexts = []);
+    I.loop_handle succeed fail supplier checkpoint
+
+  (* [tokens_stream filename text] runs the pre_parser and produces a stream
+     of (appropriately classified) tokens. *)
+
+  let tokens_stream filename text : token coq_Stream =
+    let tokens = Queue.create () in
+    let buffer = ref ErrorReports.Zero in
+    invoke_pre_parser filename text (lexer tokens buffer) buffer;
     let rec compute_token_stream () =
       let loop t v =
         Cons (Coq_existT (t, Obj.magic v), Lazy.from_fun compute_token_stream)
@@ -568,6 +613,7 @@ and singleline_comment = parse
       | ATTRIBUTE loc -> loop ATTRIBUTE't loc
       | ASM loc -> loop ASM't loc
       | PRAGMA (s, loc) -> loop PRAGMA't (s, loc)
+      | PRE_NAME _ -> assert false
     in
     Lazy.from_fun compute_token_stream
 

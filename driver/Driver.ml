@@ -20,7 +20,14 @@ open Timing
 
 let stdlib_path = ref Configuration.stdlib_path
 
+(* Optional sdump suffix *)
+let sdump_suffix = ref ".json"
+
 (* Invocation of external tools *)
+
+let rec waitpid_no_intr pid =
+  try Unix.waitpid [] pid
+  with Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_no_intr pid
 
 let command ?stdout args =
   if !option_v then begin
@@ -42,7 +49,7 @@ let command ?stdout args =
     let pid =
       Unix.create_process argv.(0) argv Unix.stdin fd_out Unix.stderr in
     let (_, status) =
-      Unix.waitpid [] pid in
+      waitpid_no_intr pid in
     if stdout <> None then Unix.close fd_out;
     match status with
     | Unix.WEXITED rc -> rc
@@ -108,19 +115,20 @@ let preprocess ifile ofile =
 (* From preprocessed C to Csyntax *)
 
 let parse_c_file sourcename ifile =
+  Debug.init_compile_unit sourcename;
   Sections.initialize();
   (* Simplification options *)
   let simplifs =
     "b" (* blocks: mandatory *)
-  ^ (if !option_fstruct_return then "s" else "")
+  ^ (if !option_fstruct_passing then "s" else "")
   ^ (if !option_fbitfields then "f" else "")
   ^ (if !option_fpacked_structs then "p" else "")
   in
   (* Parsing and production of a simplified C AST *)
-  let ast,debug =
+  let ast =
     match Parse.preprocessed_file simplifs sourcename ifile with
-    | None,_ -> exit 2
-    | Some p,d -> p,d in
+    | None -> exit 2
+    | Some p -> p in
   (* Save C AST if requested *)
   if !option_dparse then begin
     let ofile = output_filename sourcename ".c" ".parsed.c" in
@@ -141,26 +149,16 @@ let parse_c_file sourcename ifile =
     PrintCsyntax.print_program (Format.formatter_of_out_channel oc) csyntax;
     close_out oc
   end;
-  csyntax,debug
+  csyntax,None
 
-(* Dump Asm code in binary format for the validator *)
-
-let sdump_magic_number = "CompCertSDUMP" ^ Version.version
-
-let dump_asm asm destfile =
-  let oc = open_out_bin destfile in
-  output_string oc sdump_magic_number;
-  output_value oc asm;
-  output_value oc Camlcoq.string_of_atom;
-  output_value oc C2C.decl_atom;
-  close_out oc
+(* Dump Asm code in asm format for the validator *)
 
 let jdump_magic_number = "CompCertJDUMP" ^ Version.version
 
-let dump_jasm asm destfile =
+let dump_jasm asm sourcename destfile =
   let oc = open_out_bin destfile in
-  fprintf oc "{\n\"Version\":\"%s\",\n\"System\":\"%s\",\n\"Asm Ast\":%a}"
-    jdump_magic_number Configuration.system AsmToJSON.p_program asm;
+  fprintf oc "{\n\"Version\":\"%s\",\n\"System\":\"%s\"\n,\"Compilation Unit\":\"%s\",\n\"Asm Ast\":%a}"
+    jdump_magic_number Configuration.system sourcename AsmToJSON.p_program asm;
   close_out oc
 
 
@@ -187,12 +185,9 @@ let compile_c_ast sourcename csyntax ofile debug =
     | Errors.Error msg ->
         eprintf "%s: %a" sourcename print_error msg;
         exit 2 in
-  (* Dump Asm in binary and JSON format *)  
+  (* Dump Asm in binary and JSON format *)
   if !option_sdump then
-    begin
-      dump_asm asm (output_filename sourcename ".c" ".sdump");
-      dump_jasm asm (output_filename sourcename ".c" ".json")
-    end;
+      dump_jasm asm sourcename (output_filename sourcename ".c" !sdump_suffix);
   (* Print Asm in text form *)
   let oc = open_out ofile in
   PrintAsm.print_program oc asm debug;
@@ -430,11 +425,9 @@ Preprocessing options:
 Language support options (use -fno-<opt> to turn off -f<opt>) :
   -fbitfields    Emulate bit fields in structs [off]
   -flongdouble   Treat 'long double' as 'double' [off]
-  -fstruct-return  Emulate returning structs and unions by value [off]
-  -fstruct-return=<convention>
-                 Set the calling conventions used to return structs by value
-  -fstruct-passing=<convention>
-                 Set the calling conventions used to pass structs by value
+  -fstruct-passing  Support passing structs and unions by value as function
+                    results or function arguments [off]
+  -fstruct-return   Like -fstruct-passing (deprecated)
   -fvararg-calls Support calls to variable-argument functions [on]
   -funprototyped Support calls to old-style functions without prototypes [on]
   -fpacked-structs  Emulate packed structs [off]
@@ -443,6 +436,10 @@ Language support options (use -fno-<opt> to turn off -f<opt>) :
   -fnone         Turn off all language support options above
 Debugging options:
   -g             Generate debugging information
+  -gdwarf-       (GCC only) Generate debug information in DWARF v2 or DWARF v3
+  -gdepth <n>    Control generation of debugging information
+                 (<n>=0: none, <n>=1: only-globals, <n>=2: globals + locals
+                 without locations, <n>=3: full;)
   -frename-static Rename static functions and declarations
 Optimization options: (use -fno-<opt> to turn off -f<opt>)
   -O             Optimize the compiled code [on by default]
@@ -481,7 +478,7 @@ Tracing options:
   -dltl          Save LTL after register allocation in <file>.ltl
   -dmach         Save generated Mach code in <file>.mach
   -dasm          Save generated assembly in <file>.s
-  -sdump         Save info for post-linking validation in <file>.sdump
+  -sdump         Save info for post-linking validation in <file>.json
 General options:
   -stdlib <dir>  Set the path of the Compcert run-time library
   -v             Print external commands before invoking them
@@ -503,7 +500,7 @@ let print_version_and_exit _ =
 
 let language_support_options = [
   option_fbitfields; option_flongdouble;
-  option_fstruct_return; option_fvararg_calls; option_funprototyped;
+  option_fstruct_passing; option_fvararg_calls; option_funprototyped;
   option_fpacked_structs; option_finline_asm
 ]
 
@@ -517,7 +514,7 @@ let unset_all opts = List.iter (fun r -> r := false) opts
 let num_source_files = ref 0
 
 let num_input_files = ref 0
-    
+
 let cmdline_actions =
   let f_opt name ref =
     [Exact("-f" ^ name), Set ref; Exact("-fno-" ^ name), Unset ref] in
@@ -548,8 +545,19 @@ let cmdline_actions =
   Exact "-fall", Self (fun _ -> set_all language_support_options);
   Exact "-fnone", Self (fun _ -> unset_all language_support_options);
 (* Debugging options *)
-  Exact "-g", Self (fun s -> option_g := true);
+  Exact "-g", Self (fun s -> option_g := true;
+    option_gdwarf := 3);
+  Exact "-gdwarf-2", Self (fun s -> option_g:=true;
+    option_gdwarf := 2);
+  Exact "-gdwarf-3", Self (fun s -> option_g := true;
+    option_gdwarf := 3);
   Exact "-frename-static", Self (fun s -> option_rename_static:= true);
+   Exact "-gdepth", Integer (fun n -> if n = 0 || n <0 then begin
+     option_g := false
+   end else begin
+     option_g := true;
+     option_gdepth := if n > 3 then 3 else n
+   end);
 (* Code generation options -- more below *)
   Exact "-O0", Self (fun _ -> unset_all optimization_options);
   Exact "-O", Self (fun _ -> set_all optimization_options);
@@ -562,17 +570,23 @@ let cmdline_actions =
   Exact "-falign-branch-targets", Integer(fun n -> option_falignbranchtargets := n);
   Exact "-falign-cond-branches", Integer(fun n -> option_faligncondbranchs := n);
 (* Target processor options *)
+  Exact "--conf", String (fun _ -> ()); (* Ignore option since it is already handled *)
   Exact "-mthumb", Set option_mthumb;
   Exact "-marm", Unset option_mthumb;
 (* Assembling options *)
-  Prefix "-Wa,", Self (fun s -> assembler_options := s :: !assembler_options);
+  Prefix "-Wa,", Self (fun s -> if Configuration.system = "diab" then
+    assembler_options := List.rev_append (explode_comma_option s) !assembler_options
+  else
+    assembler_options := s :: !assembler_options);
 (* Linking options *)
   Prefix "-l", Self push_linker_arg;
   Prefix "-L", Self push_linker_arg;
-  Exact "-T", String (fun s -> if Configuration.system = "diab" then 
-    push_linker_arg ("-Wm"^s) 
-  else
-    push_linker_arg ("-T "^s));
+  Exact "-T", String (fun s -> if Configuration.system = "diab" then
+    push_linker_arg ("-Wm"^s)
+  else begin
+      push_linker_arg ("-T");
+      push_linker_arg(s)
+    end);
   Prefix "-Wl,", Self push_linker_arg;
 (* Tracing options *)
   Exact "-dparse", Set option_dparse;
@@ -585,6 +599,7 @@ let cmdline_actions =
   Exact "-dmach", Set option_dmach;
   Exact "-dasm", Set option_dasm;
   Exact "-sdump", Set option_sdump;
+  Exact "-sdump-suffix", String (fun s -> option_sdump := true; sdump_suffix:= s);
 (* General options *)
   Exact "-v", Set option_v;
   Exact "-stdlib", String(fun s -> stdlib_path := s);
@@ -594,33 +609,13 @@ let cmdline_actions =
   Exact "-quiet", Self (fun _ -> Interp.trace := 0);
   Exact "-trace", Self (fun _ -> Interp.trace := 2);
   Exact "-random", Self (fun _ -> Interp.mode := Interp.Random);
-  Exact "-all", Self (fun _ -> Interp.mode := Interp.All);
-(* Special -f options *)
-  Exact "-fstruct-passing=ref-callee",
-    Self (fun _ -> option_fstruct_passing_style := Configuration.SP_ref_callee);
-  Exact "-fstruct-passing=ref-caller",
-    Self (fun _ -> option_fstruct_return := true;
-                   option_fstruct_passing_style := Configuration.SP_ref_caller);
-  Exact "-fstruct-passing=ints",
-    Self (fun _ -> option_fstruct_return := true;
-                   option_fstruct_passing_style := Configuration.SP_split_args);
-  Exact "-fstruct-return=ref",
-    Self (fun _ -> option_fstruct_return := true;
-                   option_fstruct_return_style := Configuration.SR_ref);
-  Exact "-fstruct-return=int1248",
-    Self (fun _ -> option_fstruct_return := true;
-                   option_fstruct_return_style := Configuration.SR_int1248);
-  Exact "-fstruct-return=int1-4",
-    Self (fun _ -> option_fstruct_return := true;
-                   option_fstruct_return_style := Configuration.SR_int1to4);
-  Exact "-fstruct-return=int1-8",
-    Self (fun _ -> option_fstruct_return := true;
-                   option_fstruct_return_style := Configuration.SR_int1to8)
+  Exact "-all", Self (fun _ -> Interp.mode := Interp.All)
   ]
 (* -f options: come in -f and -fno- variants *)
 (* Language support options *)
   @ f_opt "longdouble" option_flongdouble
-  @ f_opt "struct-return" option_fstruct_return
+  @ f_opt "struct-return" option_fstruct_passing
+  @ f_opt "struct-passing" option_fstruct_passing
   @ f_opt "bitfields" option_fbitfields
   @ f_opt "vararg-calls" option_fvararg_calls
   @ f_opt "unprototyped" option_funprototyped
@@ -682,6 +677,7 @@ let _ =
     Builtins.set C2C.builtins;
     CPragmas.initialize();
     parse_cmdline cmdline_actions;
+    DebugInit.init (); (* Initialize the debug functions *)
     let nolink = !option_c || !option_S || !option_E || !option_interp in
     if nolink && !option_o <> None && !num_source_files >= 2 then begin
       eprintf "Ambiguous '-o' option (multiple source files)\n";

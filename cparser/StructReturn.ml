@@ -71,7 +71,7 @@ let classify_param env ty =
     | SP_ref_caller -> Param_ref_caller
     | _ ->
       match sizeof env ty, alignof env ty with
-      | Some sz, Some al -> 
+      | Some sz, Some al ->
           Param_flattened ((sz + 3) / 4, sz, al)
       | _, _ ->
           Param_unchanged  (* should not happen *)
@@ -306,7 +306,7 @@ let rec transf_expr env ctx e =
 
    We used to do a copy optimization:
      ctx = Effects:   lv = f(...)     -> f(&lv, ...)
-   but it is not correct in case of overlap (see test/regression/struct12.c) 
+   but it is not correct in case of overlap (see test/regression/struct12.c)
 
    Function calls returning a composite by value:
     ctx = Effects:   lv = f(...)     -> newtemp = f(...), lv = newtemp
@@ -412,7 +412,7 @@ and transf_init env = function
   | Init_single e ->
       Init_single (transf_expr env Val e)
   | Init_array il ->
-      Init_array (List.map (transf_init env) il)
+      Init_array (List.rev (List.rev_map (transf_init env) il))
   | Init_struct(id, fil) ->
       Init_struct (id, List.map (fun (fld, i) -> (fld, transf_init env i)) fil)
   | Init_union(id, fld, i) ->
@@ -521,8 +521,8 @@ let rec transf_funparams loc env params =
           let tpx = TPtr(tx', []) in
           let ex = { edesc = EVar x; etyp = tpx } in
           let estarx = { edesc = EUnop(Oderef, ex); etyp = tx' } in
-          ((x, tpx) :: params', 
-           actions, 
+          ((x, tpx) :: params',
+           actions,
            IdentMap.add x estarx subst)
       | Param_flattened(n, sz, al) ->
           let y = new_temp ~name:x.name (ty_buffer n) in
@@ -562,7 +562,7 @@ let transf_fundef env f =
     | Ret_value(ty, sz, al) ->
         (f.fd_attrib,
          ty,
-         params, 
+         params,
          transf_funbody env (subst_stmt subst f.fd_body) None) in
   let temps = get_temps() in
   {f with fd_attrib = attr1;
@@ -582,11 +582,11 @@ let program p =
   struct_passing_style :=
     if !Clflags.option_interp
     then SP_ref_callee
-    else !Clflags.option_fstruct_passing_style;
+    else Configuration.struct_passing_style;
   struct_return_style :=
     if !Clflags.option_interp
     then SR_ref
-    else !Clflags.option_fstruct_return_style;
+    else Configuration.struct_return_style;
   Transform.program
     ~decl:transf_decl
     ~fundef:transf_fundef

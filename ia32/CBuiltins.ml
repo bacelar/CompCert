@@ -41,19 +41,19 @@ let builtins = {
     "__builtin_fmin",
       (TFloat(FDouble, []), [TFloat(FDouble, []); TFloat(FDouble, [])], false);
     "__builtin_fmadd",
-      (TFloat(FDouble, []), 
+      (TFloat(FDouble, []),
        [TFloat(FDouble, []); TFloat(FDouble, []); TFloat(FDouble, [])],
        false);
     "__builtin_fmsub",
-      (TFloat(FDouble, []), 
+      (TFloat(FDouble, []),
        [TFloat(FDouble, []); TFloat(FDouble, []); TFloat(FDouble, [])],
        false);
     "__builtin_fnmadd",
-      (TFloat(FDouble, []), 
+      (TFloat(FDouble, []),
        [TFloat(FDouble, []); TFloat(FDouble, []); TFloat(FDouble, [])],
        false);
     "__builtin_fnmsub",
-      (TFloat(FDouble, []), 
+      (TFloat(FDouble, []),
        [TFloat(FDouble, []); TFloat(FDouble, []); TFloat(FDouble, [])],
        false);
     (* Memory accesses *)
@@ -65,6 +65,9 @@ let builtins = {
       (TVoid [], [TPtr(TInt(IUShort, []), []); TInt(IUShort, [])], false);
     "__builtin_write32_reversed",
       (TVoid [], [TPtr(TInt(IUInt, []), []); TInt(IUInt, [])], false);
+    (* no operation *)
+    "__builtin_nop",
+      (TVoid [], [], false);
   ]
 }
 

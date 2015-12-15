@@ -144,9 +144,9 @@ Fixpoint debug_strength_reduction (ae: AE.t) (al: list (builtin_arg reg)) :=
   | a :: al =>
       let a' := builtin_arg_reduction ae a in
       let al' := a :: debug_strength_reduction ae al in
-      match a' with
-      | BA_int _ | BA_long _ | BA_float _ | BA_single _ => a' :: al'
-      | _ => al'
+      match a, a' with
+      | BA _, (BA_int _ | BA_long _ | BA_float _ | BA_single _) => a' :: al'
+      | _, _ => al'
       end
   end.
 
@@ -183,12 +183,12 @@ Definition transf_instr (f: function) (an: PMap.t VA.t) (rm: romem)
               Iop cop nil dst s
           | None =>
               let (addr', args') := addr_strength_reduction addr args aargs in
-              Iload chunk addr' args' dst s      
+              Iload chunk addr' args' dst s
           end
       | Istore chunk addr args src s =>
           let aargs := aregs ae args in
           let (addr', args') := addr_strength_reduction addr args aargs in
-          Istore chunk addr' args' src s      
+          Istore chunk addr' args' src s
       | Icall sig ros args res s =>
           Icall sig (transf_ros ae ros) args res s
       | Itailcall sig ros args =>

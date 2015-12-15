@@ -23,6 +23,13 @@ open Asmexpandaux
 
 exception Error of string
 
+(* FreeScale's EREF extensions *)
+
+let eref =
+  match Configuration.model with
+  | "e5500" -> true
+  | _ -> false
+
 (* Useful constants and helper functions *)
 
 let _0 = Integers.Int.zero
@@ -31,6 +38,8 @@ let _2 = coqint_of_camlint 2l
 let _4 = coqint_of_camlint 4l
 let _6 = coqint_of_camlint 6l
 let _8 = coqint_of_camlint 8l
+let _31 = coqint_of_camlint 31l
+let _32 = coqint_of_camlint 32l
 let _m4 = coqint_of_camlint (-4l)
 let _m8 = coqint_of_camlint (-8l)
 
@@ -41,7 +50,7 @@ let emit_addimm rd rs n =
   List.iter emit (Asmgen.addimm rd rs n [])
 
 
-			    
+
 (* Handling of annotations *)
 
 let expand_annot_val txt targ args res =
@@ -64,7 +73,7 @@ let expand_annot_val txt targ args res =
    Note that lfd and stfd cannot trap on ill-formed floats. *)
 
 let offset_in_range ofs =
-  Int.eq (Asmgen.high_s ofs) Int.zero
+  Int.eq (Asmgen.high_s ofs) _0
 
 let memcpy_small_arg sz arg tmp =
   match arg with
@@ -79,7 +88,7 @@ let memcpy_small_arg sz arg tmp =
       assert false
 
 let expand_builtin_memcpy_small sz al src dst =
-  let (tsrc, tdst) = 
+  let (tsrc, tdst) =
     if dst <> BA (IR GPR11) then (GPR11, GPR12) else (GPR12, GPR11) in
   let (rsrc, osrc) = memcpy_small_arg sz src tsrc in
   let (rdst, odst) = memcpy_small_arg sz dst tdst in
@@ -117,7 +126,7 @@ let expand_builtin_memcpy_big sz al src dst =
   assert (sz >= 4);
   emit_loadimm GPR0 (Z.of_uint (sz / 4));
   emit (Pmtctr GPR0);
-  let (s, d) = 
+  let (s, d) =
     if dst <> BA (IR GPR11) then (GPR11, GPR12) else (GPR12, GPR11) in
   memcpy_big_arg src s;
   memcpy_big_arg dst d;
@@ -185,7 +194,7 @@ let rec expand_builtin_vload_common chunk base offset res =
             emit (Plwz(lo, offset', base));
             emit (Plwz(hi, offset, base))
           end
-      | None ->      
+      | None ->
           emit (Paddi(GPR11, base, offset));
           expand_builtin_vload_common chunk GPR11 (Cint _0) res
       end
@@ -239,7 +248,7 @@ let expand_builtin_vstore_common chunk base offset src =
       | Some offset' ->
           emit (Pstw(hi, offset, base));
           emit (Pstw(lo, offset', base))
-      | None ->      
+      | None ->
           let tmp = temp_for_vstore src in
           emit (Paddi(tmp, base, offset));
           emit (Pstw(hi, Cint _0, tmp));
@@ -276,9 +285,9 @@ let expand_builtin_vstore chunk args =
       assert false
 
 (* Handling of varargs *)
-let linkregister_offset = ref  Int.zero
+let linkregister_offset = ref  _0
 
-let retaddr_offset = ref Int.zero
+let retaddr_offset = ref _0
 
 let current_function_stacksize = ref 0l
 
@@ -327,6 +336,19 @@ let expand_builtin_va_start r =
 let expand_int64_arith conflict rl fn =
   if conflict then (fn GPR0; emit (Pmr(rl, GPR0))) else fn rl
 
+(* Convert integer constant into GPR with corresponding number *)
+let int_to_int_reg = function
+   | 0 -> Some GPR0  | 1 -> Some GPR1  | 2 -> Some GPR2  | 3 -> Some GPR3
+   | 4 -> Some GPR4  | 5 -> Some GPR5  | 6 -> Some GPR6  | 7 -> Some GPR7
+   | 8 -> Some GPR8  | 9 -> Some GPR9  | 10 -> Some GPR10 | 11 -> Some GPR11
+   | 12 -> Some GPR12 | 13 -> Some GPR13 | 14 -> Some GPR14 | 15 -> Some GPR15
+   | 16 -> Some GPR16 | 17 -> Some GPR17 | 18 -> Some GPR18 | 19 -> Some GPR19
+   | 20 -> Some GPR20 | 21 -> Some GPR21 | 22 -> Some GPR22 | 23 -> Some GPR23
+   | 24 -> Some GPR24 | 25 -> Some GPR25 | 26 -> Some GPR26 | 27 -> Some GPR27
+   | 28 -> Some GPR28 | 29 -> Some GPR29 | 30 -> Some GPR30 | 31 -> Some GPR31
+   | _ -> None
+
+
 (* Handling of compiler-inlined builtins *)
 
 let expand_builtin_inline name args res =
@@ -337,8 +359,18 @@ let expand_builtin_inline name args res =
       emit (Pmulhw(res, a1, a2))
   | "__builtin_mulhwu", [BA(IR a1); BA(IR a2)], BR(IR res) ->
       emit (Pmulhwu(res, a1, a2))
-  | "__builtin_clz", [BA(IR a1)], BR(IR res) ->
+  | ("__builtin_clz" | "__builtin_clzl"), [BA(IR a1)], BR(IR res) ->
       emit (Pcntlzw(res, a1))
+  | "__builtin_clzll", [BA_splitlong(BA(IR ah), BA(IR al))], BR(IR res) ->
+      let lbl = new_label () in
+      emit (Pcntlzw(res, ah));
+      (* less than 32 bits zero? *)
+      emit (Pcmpwi (res, Cint _32));
+      emit (Pbf (CRbit_2, lbl));
+      (* high bits all zero, count bits in low word and increment by 32 *)
+      emit (Pcntlzw(res, al));
+      emit (Paddi(res, res, Cint _32));
+      emit (Plabel lbl)
   | "__builtin_cmpb",  [BA(IR a1); BA(IR a2)], BR(IR res) ->
       emit (Pcmpb (res,a1,a2))
   | ("__builtin_bswap" | "__builtin_bswap32"), [BA(IR a1)], BR(IR res) ->
@@ -421,11 +453,11 @@ let expand_builtin_inline name args res =
       emit (Pisync)
   | "__builtin_lwsync", [], _ ->
       emit (Plwsync)
-  | "__builtin_mbar",  [BA_int mo], _ ->
+  | "__builtin_mbar", [BA_int mo], _ ->
       if not (mo = _0 || mo = _1) then
         raise (Error "the argument of __builtin_mbar must be 0 or 1");
       emit (Pmbar mo)
-  | "__builin_mbar",_, _ ->
+  | "__builin_mbar", _, _ ->
       raise (Error "the argument of __builtin_mbar must be a constant");
   | "__builtin_trap", [], _ ->
       emit (Ptrap)
@@ -441,8 +473,8 @@ let expand_builtin_inline name args res =
       emit (Picbi(GPR0,a1))
   | "__builtin_dcbtls", [BA (IR a1); BA_int loc],_ ->
       if not ((Int.eq loc _0) || (Int.eq loc _2)) then
-        raise (Error "the second argument of __builtin_dcbtls must be a constant between 0 and 2");
-      emit (Pdcbtls (loc,GPR0,a1))    
+        raise (Error "the second argument of __builtin_dcbtls must be 0 or 2");
+      emit (Pdcbtls (loc,GPR0,a1))
   | "__builtin_dcbtls",_,_ ->
       raise (Error "the second argument of __builtin_dcbtls must be a constant")
   | "__builtin_icbtls", [BA (IR a1); BA_int loc],_ ->
@@ -473,20 +505,111 @@ let expand_builtin_inline name args res =
       emit (Pmtspr(n, a1))
   | "__builtin_set_spr", _, _ ->
       raise (Error "the first argument of __builtin_set_spr must be a constant")
+  (* Special registers in 32bit hybrid mode *)
+  | "__builtin_get_spr64", [BA_int n], BR_splitlong(BR(IR rh), BR(IR rl)) ->
+      emit (Pmfspr(rl, n));
+      emit (Prldicl(rh, rl, _32, _32));
+      emit (Prldicl(rl, rl, _0, _32))
+  | "__builtin_get_spr64", _, _ ->
+      raise (Error "the argument of __builtin_get_spr64 must be a constant")
+  | "__builtin_set_spr64", [BA_int n; BA_splitlong(BA(IR ah), BA(IR al))], _ ->
+    emit (Prldicr(GPR10, ah, _32, _31));
+    emit (Prldicl(al, al, _0, _32));
+    emit (Pori(GPR10, al, Cint _0));
+    emit (Pmtspr(n, GPR10))
+  | "__builtin_set_spr64", _, _ ->
+      raise (Error "the first argument of __builtin_set_spr64 must be a constant")
+  (* Move registers *)
+  | "__builtin_mr", [BA_int dst; BA_int src], _ ->
+      (match int_to_int_reg (Z.to_int dst), int_to_int_reg (Z.to_int src) with
+       | Some dst, Some src -> emit (Pori (dst, src, Cint _0))
+       | _, _ -> raise (Error "the arguments of __builtin_mr must be in the range of 0..31"))
+  | "__builtin_mr", _, _ ->
+      raise (Error "the arguments of __builtin_mr must be constants")
   (* Frame and return address *)
   | "__builtin_call_frame", _,BR (IR res) ->
-      let sz = !current_function_stacksize 
+      let sz = !current_function_stacksize
       and ofs = !linkregister_offset in
-      if sz < 0x8000l then
+      if sz < 0x8000l && sz >= 0l then
         emit (Paddi(res, GPR1, Cint(coqint_of_camlint sz)))
       else
         emit (Plwz(res, Cint ofs, GPR1))
   | "__builtin_return_address",_,BR (IR res) ->
       emit (Plwz (res, Cint! retaddr_offset,GPR1))
-  (* isel *)
-  | "__builtin_isel", [BA (IR a1); BA (IR a2); BA (IR a3)],BR (IR res) ->
-      emit (Pcmpwi (a1,Cint (Int.zero)));
-      emit (Pisel (res,a3,a2,CRbit_2))
+  (* Integer selection *)
+  | ("__builtin_isel" | "__builtin_uisel"), [BA (IR a1); BA (IR a2); BA (IR a3)],BR (IR res) ->
+      if eref then begin
+        emit (Pcmpwi (a1,Cint (Int.zero)));
+        emit (Pisel (res,a3,a2,CRbit_2))
+      end else if a2 = a3 then
+        emit (Pmr (res, a2))
+      else begin
+        (* a1 has type _Bool, hence it is 0 or 1 *)
+        emit (Psubfic (GPR0, a1, Cint _0));
+        (* r0 = 0xFFFF_FFFF if a1 is true, r0 = 0 if a1 is false *)
+        if res <> a3 then begin
+          emit (Pand_ (res, a2, GPR0));
+          emit (Pandc (GPR0, a3, GPR0))
+        end else begin
+          emit (Pandc (res, a3, GPR0));
+          emit (Pand_ (GPR0, a2, GPR0))
+        end;
+        emit (Por (res, res, GPR0))
+      end
+  (* no operation *)
+  | "__builtin_nop", [], _ ->
+      emit (Pori (GPR0, GPR0, Cint _0))
+  (* atomic operations *)
+  | "__builtin_atomic_exchange", [BA (IR a1); BA (IR a2); BA (IR a3)],_ ->
+      emit (Plwz (GPR10,Cint _0,a2));
+      emit (Psync);
+      let lbl = new_label() in
+      emit (Plabel lbl);
+      emit (Plwarx (GPR0,GPR0,a1));
+      emit (Pstwcx_ (GPR10,GPR0,a1));
+      emit (Pbf (CRbit_2,lbl));
+      emit (Pisync);
+      emit (Pstw (GPR0,Cint _0,a3))
+  | "__builtin_atomic_load", [BA (IR a1); BA (IR a2)],_ ->
+      let lbl = new_label () in
+      emit (Psync);
+      emit (Plwz (GPR0,Cint _0,a1));
+      emit (Pcmpw (GPR0,GPR0));
+      emit (Pbf (CRbit_2,lbl));
+      emit (Plabel lbl);
+      emit (Pisync);
+      emit (Pstw (GPR0,Cint _0, a2))
+  | "__builtin_sync_fetch_and_add", [BA (IR a1); BA(IR a2)], BR (IR res) ->
+      let lbl = new_label() in
+      emit (Psync);
+      emit (Plabel lbl);
+      emit (Plwarx (res,GPR0,a1));
+      emit (Padd (GPR0,res,a2));
+      emit (Pstwcx_ (GPR0,GPR0,a1));
+      emit (Pbf (CRbit_2, lbl));
+      emit (Pisync);
+  | "__builtin_atomic_compare_exchange", [BA (IR dst); BA(IR exp); BA (IR des)],  BR (IR res) ->
+      let lbls = new_label ()
+      and lblneq = new_label ()
+      and lblsucc = new_label () in
+      emit (Plwz (GPR10,Cint _0,exp));
+      emit (Plwz (GPR11,Cint _0,des));
+      emit (Psync);
+      emit (Plabel lbls);
+      emit (Plwarx (GPR0,GPR0,dst));
+      emit (Pcmpw (GPR0,GPR10));
+      emit (Pbf (CRbit_2,lblneq));
+      emit (Pstwcx_ (GPR11,GPR0,dst));
+      emit (Pbf (CRbit_2,lbls));
+      emit (Plabel lblneq);
+      (* Here, CR2 is true if the exchange succeeded, false if it failed *)
+      emit (Pisync);
+      emit (Pmfcr GPR10);
+      emit (Prlwinm (res,GPR10,(Z.of_uint 3),_1));
+      (* Update exp with the current value of dst if the exchange failed *)
+      emit (Pbt (CRbit_2,lblsucc));
+      emit (Pstw (GPR0,Cint _0,exp));
+      emit (Plabel lblsucc)
   (* Catch-all *)
   | _ ->
       raise (Error ("unrecognized builtin " ^ name))
@@ -517,10 +640,10 @@ let expand_instruction instr =
   | Pallocframe(sz, ofs,retofs) ->
       let variadic = (!current_function).fn_sig.sig_cc.cc_vararg in
       let sz = camlint_of_coqint sz in
-      assert (ofs = Int.zero);
+      assert (ofs = _0);
       let sz = if variadic then Int32.add sz 96l else sz in
       let adj = Int32.neg sz in
-      if adj >= -0x8000l then
+      if adj >= -0x8000l && adj < 0l then
         emit (Pstwu(GPR1, Cint(coqint_of_camlint adj), GPR1))
       else begin
         emit_loadimm GPR0 (coqint_of_camlint adj);
@@ -543,12 +666,38 @@ let expand_instruction instr =
       let variadic = (!current_function).fn_sig.sig_cc.cc_vararg in
       let sz = camlint_of_coqint sz in
       let sz = if variadic then Int32.add sz 96l else sz in
-      if sz < 0x8000l then
+      if sz < 0x8000l && sz >= 0l then
         emit (Paddi(GPR1, GPR1, Cint(coqint_of_camlint sz)))
       else
         emit (Plwz(GPR1, Cint ofs, GPR1))
+  | Pfcfi(r1, r2) ->
+      assert (Archi.ppc64);
+      emit (Pextsw(GPR0, r2));
+      emit (Pstdu(GPR0, Cint _m8, GPR1));
+      emit (Pcfi_adjust _8);
+      emit (Plfd(r1, Cint _0, GPR1));
+      emit (Pfcfid(r1, r1));
+      emit (Paddi(GPR1, GPR1, Cint _8));
+      emit (Pcfi_adjust _m8)
+  | Pfcfiu(r1, r2) ->
+      assert (Archi.ppc64);
+      emit (Prldicl(GPR0, r2, _0, _32));
+      emit (Pstdu(GPR0, Cint _m8, GPR1));
+      emit (Pcfi_adjust _8);
+      emit (Plfd(r1, Cint _0, GPR1));
+      emit (Pfcfid(r1, r1));
+      emit (Paddi(GPR1, GPR1, Cint _8));
+      emit (Pcfi_adjust _m8)
   | Pfcti(r1, r2) ->
       emit (Pfctiwz(FPR13, r2));
+      emit (Pstfdu(FPR13, Cint _m8, GPR1));
+      emit (Pcfi_adjust _8);
+      emit (Plwz(r1, Cint _4, GPR1));
+      emit (Paddi(GPR1, GPR1, Cint _8));
+      emit (Pcfi_adjust _m8)
+  | Pfctiu(r1, r2) ->
+      assert (Archi.ppc64);
+      emit (Pfctidz(FPR13, r2));
       emit (Pstfdu(FPR13, Cint _m8, GPR1));
       emit (Pcfi_adjust _8);
       emit (Plwz(r1, Cint _4, GPR1));
@@ -569,7 +718,7 @@ let expand_instruction instr =
   | Pbuiltin(ef, args, res) ->
       begin match ef with
       | EF_builtin(name, sg) ->
-          expand_builtin_inline (extern_atom name) args res
+          expand_builtin_inline (camlstring_of_coqstring name) args res
       | EF_vload chunk ->
           expand_builtin_vload chunk args res
       | EF_vstore chunk ->
@@ -586,17 +735,50 @@ let expand_instruction instr =
   | _ ->
       emit instr
 
-let expand_function fn =
+
+(* Translate to the integer identifier of the register as
+   the EABI specifies *)
+
+let int_reg_to_dwarf = function
+   | GPR0 -> 0  | GPR1 -> 1  | GPR2 -> 2  | GPR3 -> 3
+   | GPR4 -> 4  | GPR5 -> 5  | GPR6 -> 6  | GPR7 -> 7
+   | GPR8 -> 8  | GPR9 -> 9  | GPR10 -> 10 | GPR11 -> 11
+   | GPR12 -> 12 | GPR13 -> 13 | GPR14 -> 14 | GPR15 -> 15
+   | GPR16 -> 16 | GPR17 -> 17 | GPR18 -> 18 | GPR19 -> 19
+   | GPR20 -> 20 | GPR21 -> 21 | GPR22 -> 22 | GPR23 -> 23
+   | GPR24 -> 24 | GPR25 -> 25 | GPR26 -> 26 | GPR27 -> 27
+   | GPR28 -> 28 | GPR29 -> 29 | GPR30 -> 30 | GPR31 -> 31
+
+let float_reg_to_dwarf = function
+   | FPR0 -> 32  | FPR1 -> 33  | FPR2 -> 34  | FPR3 -> 35
+   | FPR4 -> 36  | FPR5 -> 37  | FPR6 -> 38  | FPR7 -> 39
+   | FPR8 -> 40  | FPR9 -> 41  | FPR10 -> 42 | FPR11 -> 43
+   | FPR12 -> 44 | FPR13 -> 45 | FPR14 -> 46 | FPR15 -> 47
+   | FPR16 -> 48 | FPR17 -> 49 | FPR18 -> 50 | FPR19 -> 51
+   | FPR20 -> 52 | FPR21 -> 53 | FPR22 -> 54| FPR23 -> 55
+   | FPR24 -> 56 | FPR25 -> 57 | FPR26 -> 58 | FPR27 -> 59
+   | FPR28 -> 60 | FPR29 -> 61 | FPR30 -> 62 | FPR31 -> 63
+
+let preg_to_dwarf = function
+   | IR r -> int_reg_to_dwarf r
+   | FR r -> float_reg_to_dwarf r
+   | _ -> assert false
+
+
+let expand_function id fn =
   try
     set_current_function fn;
-    List.iter expand_instruction fn.fn_code;
+    if !Clflags.option_g then
+      expand_debug id 1 preg_to_dwarf expand_instruction fn.fn_code
+    else
+      List.iter expand_instruction fn.fn_code;
     Errors.OK (get_current_function ())
   with Error s ->
     Errors.Error (Errors.msg (coqstring_of_camlstring s))
 
-let expand_fundef = function
+let expand_fundef id = function
   | Internal f ->
-      begin match expand_function f with
+      begin match expand_function id f with
       | Errors.OK tf -> Errors.OK (Internal tf)
       | Errors.Error msg -> Errors.Error msg
       end
@@ -604,4 +786,4 @@ let expand_fundef = function
       Errors.OK (External ef)
 
 let expand_program (p: Asm.program) : Asm.program Errors.res =
-  AST.transform_partial_program expand_fundef p
+  AST.transform_partial_ident_program expand_fundef p

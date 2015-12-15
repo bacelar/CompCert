@@ -18,8 +18,11 @@ type identifier_type =
   | TypedefId
   | OtherId
 
-let push_context:(unit -> unit) ref= ref (fun () -> assert false)
-let pop_context:(unit -> unit) ref = ref (fun () -> assert false)
+(* Applying once this functions saves the current context, and
+   applying it the second time restores it. *)
+let save_context:(unit -> (unit -> unit)) ref = ref (fun _ -> assert false)
 
+(* Change the context by changing an identifier to be a varname or a
+   typename *)
 let declare_varname:(string -> unit) ref = ref (fun _ -> assert false)
 let declare_typename:(string -> unit) ref = ref (fun _ -> assert false)

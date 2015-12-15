@@ -56,9 +56,11 @@ let elab_loc l = (l.filename, l.lineno)
 
 let top_declarations = ref ([] : globdecl list)
 
-let emit_elab loc td =
+let emit_elab ?(enter:bool=true) env loc td =
   let loc = elab_loc loc in
-  top_declarations := { gdesc = td; gloc = loc } :: !top_declarations
+  let dec ={ gdesc = td; gloc = loc } in
+  if enter then  Debug.insert_global_declaration env dec;
+  top_declarations := dec :: !top_declarations
 
 let reset() = top_declarations := []
 
@@ -101,7 +103,7 @@ let elab_funbody_f : (C.typ -> Env.t -> statement -> C.stmt) ref
 
 (** * Elaboration of constants - C99 section 6.4.4 *)
 
-let has_suffix s suff = 
+let has_suffix s suff =
   let ls = String.length s and lsuff = String.length suff in
   ls >= lsuff && String.sub s (ls - lsuff) lsuff = suff
 
@@ -109,7 +111,7 @@ let chop_last s n =
   assert (String.length s >= n);
   String.sub s 0 (String.length s - n)
 
-let has_prefix s pref = 
+let has_prefix s pref =
   let ls = String.length s and lpref = String.length pref in
   ls >= lpref && String.sub s 0 lpref = pref
 
@@ -193,7 +195,7 @@ let elab_int_constant loc s0 =
   in
   (* Find smallest allowable type that fits *)
   let ty =
-    try List.find (fun ty -> integer_representable v ty) 
+    try List.find (fun ty -> integer_representable v ty)
                   (if base = 10 then dec_kinds else hex_kinds)
     with Not_found ->
       error loc "integer literal '%s' cannot be represented" s0;
@@ -222,7 +224,7 @@ let elab_char_constant loc wide chars =
   let max_digit = Int64.shift_left 1L nbits in
   let max_val = Int64.shift_left 1L (64 - nbits) in
   let v =
-    List.fold_left 
+    List.fold_left
       (fun acc d ->
         if acc < 0L || acc >= max_val then
           error loc "character constant overflows";
@@ -241,7 +243,7 @@ let elab_char_constant loc wide chars =
        IInt)
 
 let elab_string_literal loc wide chars =
-  let nbits = if wide then 8 * !config.sizeof_wchar else 8 in 
+  let nbits = if wide then 8 * !config.sizeof_wchar else 8 in
   let char_max = Int64.shift_left 1L nbits in
   List.iter
     (fun c ->
@@ -388,7 +390,7 @@ let rec elab_specifier ?(only = false) loc env specifier =
   let sto = ref Storage_default
   and inline = ref false
   and attr = ref []
-  and tyspecs = ref [] 
+  and tyspecs = ref []
   and typedef = ref false in
 
   let do_specifier = function
@@ -402,7 +404,7 @@ let rec elab_specifier ?(only = false) loc env specifier =
       | STATIC -> sto := Storage_static
       | EXTERN -> sto := Storage_extern
       | REGISTER -> sto := Storage_register
-      | TYPEDEF -> 
+      | TYPEDEF ->
           if !typedef then
             error loc "multiple uses of 'typedef'";
           typedef := true
@@ -516,9 +518,9 @@ and elab_cvspecs env cv_specs =
 
 (* Elaboration of a type declarator.  C99 section 6.7.5. *)
 
-and elab_type_declarator loc env ty = function
+and elab_type_declarator loc env ty kr_ok = function
   | Cabs.JUSTBASE ->
-      (ty, env)
+      ((ty, None), env)
   | Cabs.ARRAY(d, cv_specs, sz) ->
       let a = elab_cvspecs env cv_specs in
       let sz' =
@@ -534,32 +536,41 @@ and elab_type_declarator loc env ty = function
             | None ->
                 error loc "array size is not a compile-time constant";
                 Some 1L in (* produces better error messages later *)
-       elab_type_declarator loc env (TArray(ty, sz', a)) d
+       elab_type_declarator loc env (TArray(ty, sz', a)) kr_ok d
   | Cabs.PTR(cv_specs, d) ->
       let a = elab_cvspecs env cv_specs in
-      elab_type_declarator loc env (TPtr(ty, a)) d
+      elab_type_declarator loc env (TPtr(ty, a)) kr_ok d
   | Cabs.PROTO(d, (params, vararg)) ->
-       begin match unroll env ty with
-       | TArray _ | TFun _ ->
-           error loc "illegal function return type@ %a" Cprint.typ ty
-       | _ -> ()
-       end;
-       let params' = elab_parameters env params in
-       elab_type_declarator loc env (TFun(ty, params', vararg, [])) d
+      begin match unroll env ty with
+      | TArray _ | TFun _ ->
+          error loc "Illegal function return type@ %a" Cprint.typ ty
+      | _ -> ()
+      end;
+      let params' = elab_parameters env params in
+      elab_type_declarator loc env (TFun(ty, Some params', vararg, [])) kr_ok d
+  | Cabs.PROTO_OLD(d, params) ->
+      begin match unroll env ty with
+      | TArray _ | TFun _ ->
+        error loc "Illegal function return type@ %a" Cprint.typ ty
+      | _ -> ()
+      end;
+      match params with
+      | [] ->
+        elab_type_declarator loc env (TFun(ty, None, false, [])) kr_ok d
+      | _ ->
+        if not kr_ok || d <> Cabs.JUSTBASE then
+          fatal_error loc "Illegal old-style K&R function definition";
+        ((TFun(ty, None, false, []), Some params), env)
 
 (* Elaboration of parameters in a prototype *)
 
 and elab_parameters env params =
-  match params with
-  | [] -> (* old-style K&R prototype *)
-      None
-  | _ ->
-      (* Prototype introduces a new scope *)
-      let (vars, _) = mmap elab_parameter (Env.new_scope env) params in
-      (* Catch special case f(void) *)
-      match vars with
-        | [ ( {name=""}, TVoid _) ] -> Some []
-        | _ -> Some vars
+  (* Prototype introduces a new scope *)
+  let (vars, _) = mmap elab_parameter (Env.new_scope env) params in
+  (* Catch special case f(t) where t is void or a typedef to void *)
+  match vars with
+    | [ ( {name=""}, t) ] when is_void_type env t -> []
+    | _ -> vars
 
 (* Elaboration of a function parameter *)
 
@@ -567,7 +578,7 @@ and elab_parameter env (PARAM (spec, id, decl, attr, loc)) =
   let (sto, inl, tydef, bty, env1) = elab_specifier loc env spec in
   if tydef then
     error loc "'typedef' used in function parameter";
-  let (ty, env2) = elab_type_declarator loc env1 bty decl in
+  let ((ty, _), env2) = elab_type_declarator loc env1 bty false decl in
   let ty = add_attributes_type (elab_attributes env attr) ty in
   if sto <> Storage_default && sto <> Storage_register then
     error loc
@@ -584,13 +595,13 @@ and elab_parameter env (PARAM (spec, id, decl, attr, loc)) =
 
 (* Elaboration of a (specifier, Cabs "name") pair *)
 
-and elab_name env spec (Name (id, decl, attr, loc)) =
+and elab_fundef_name env spec (Name (id, decl, attr, loc)) =
   let (sto, inl, tydef, bty, env') = elab_specifier loc env spec in
   if tydef then
     error loc "'typedef' is forbidden here";
-  let (ty, env'') = elab_type_declarator loc env' bty decl in 
+  let ((ty, kr_params), env'') = elab_type_declarator loc env' bty true decl in
   let a = elab_attributes env attr in
-  (id, sto, inl, add_attributes_type a ty, env'')
+  (id, sto, inl, add_attributes_type a ty, kr_params, env'')
 
 (* Elaboration of a name group.  C99 section 6.7.6 *)
 
@@ -602,8 +613,8 @@ and elab_name_group loc env (spec, namelist) =
   if inl then
     error loc "'inline' is forbidden here";
   let elab_one_name env (Name (id, decl, attr, loc)) =
-    let (ty, env1) =
-      elab_type_declarator loc env bty decl in 
+    let ((ty, _), env1) =
+      elab_type_declarator loc env bty false decl in
     let a = elab_attributes env attr in
     ((id, add_attributes_type a ty), env1) in
   (mmap elab_one_name env' namelist, sto)
@@ -614,8 +625,8 @@ and elab_init_name_group loc env (spec, namelist) =
   let (sto, inl, tydef, bty, env') =
     elab_specifier ~only:(namelist=[]) loc env spec in
   let elab_one_name env (Init_name (Name (id, decl, attr, loc), init)) =
-    let (ty, env1) =
-      elab_type_declarator loc env bty decl in 
+    let ((ty, _), env1) =
+      elab_type_declarator loc env bty false decl in
     let a = elab_attributes env attr in
     if inl && not (is_function_type env ty) then
       error loc "'inline' can only appear on functions";
@@ -679,7 +690,7 @@ and elab_field_group env (Field_group (spec, fieldlist, loc)) =
                 error loc "bit size of '%s' is not a compile-time constant" id;
                 None
           end in
-    { fld_name = id; fld_typ = ty; fld_bitfield = optbitsize' } 
+    { fld_name = id; fld_typ = ty; fld_bitfield = optbitsize' }
   in
   (List.map2 elab_bitfield fieldlist names, env')
 
@@ -730,7 +741,7 @@ and elab_struct_or_union only kind loc tag optmembers attrs env =
       (* finishing the definition of an incomplete struct or union *)
       let (ci', env') = elab_struct_or_union_info kind loc env members attrs in
       (* Emit a global definition for it *)
-      emit_elab loc (Gcompositedef(kind, tag', attrs, ci'.ci_members));
+      emit_elab env' loc (Gcompositedef(kind, tag', attrs, ci'.ci_members));
       (* Replace infos but keep same ident *)
       (tag', Env.add_composite env' tag' ci')
   | Some(tag', {ci_sizeof = Some _}), Some _
@@ -745,7 +756,7 @@ and elab_struct_or_union only kind loc tag optmembers attrs env =
       (* enter it with a new name *)
       let (tag', env') = Env.enter_composite env tag ci in
       (* emit it *)
-      emit_elab loc (Gcompositedecl(kind, tag', attrs));
+      emit_elab env' loc (Gcompositedecl(kind, tag', attrs));
       (tag', env')
   | _, Some members ->
       (* definition of a complete struct or union *)
@@ -753,12 +764,12 @@ and elab_struct_or_union only kind loc tag optmembers attrs env =
       (* enter it, incomplete, with a new name *)
       let (tag', env') = Env.enter_composite env tag ci1 in
       (* emit a declaration so that inner structs and unions can refer to it *)
-      emit_elab loc (Gcompositedecl(kind, tag', attrs));
+      emit_elab env' loc (Gcompositedecl(kind, tag', attrs));
       (* elaborate the members *)
       let (ci2, env'') =
         elab_struct_or_union_info kind loc env' members attrs in
       (* emit a definition *)
-      emit_elab loc (Gcompositedef(kind, tag', attrs, ci2.ci_members));
+      emit_elab env'' loc (Gcompositedef(kind, tag', attrs, ci2.ci_members));
       (* Replace infos but keep same ident *)
       (tag', Env.add_composite env'' tag' ci2)
 
@@ -809,14 +820,14 @@ and elab_enum only loc tag optmembers attrs env =
       let (dcls, env') = elab_members env 0L members in
       let info = { ei_members = dcls; ei_attr = attrs } in
       let (tag', env'') = Env.enter_enum env' tag info in
-      emit_elab loc (Genumdef(tag', attrs, dcls));
+      emit_elab env' loc (Genumdef(tag', attrs, dcls));
       (tag', env'')
 
 (* Elaboration of a naked type, e.g. in a cast *)
 
 let elab_type loc env spec decl =
   let (sto, inl, tydef, bty, env') = elab_specifier loc env spec in
-  let (ty, env'') = elab_type_declarator loc env' bty decl in 
+  let ((ty, _), env'') = elab_type_declarator loc env' bty false decl in
   if sto <> Storage_default || inl || tydef then
     error loc "'typedef', 'extern', 'static', 'register' and 'inline' are meaningless in cast";
   (ty, env'')
@@ -839,18 +850,18 @@ let init_char_array_string opt_size s =
   Init_array (add_chars (Int64.pred size) [])
 
 let init_int_array_wstring opt_size s =
-  let len = Int64.of_int (List.length s) in
+  let a = Array.of_list s in
+  let len = Int64.of_int (Array.length a) in
   let size =
     match opt_size with
     | Some sz -> sz
     | None -> Int64.succ len  (* include final 0 character *) in
-  let rec add_chars i s init =
+  let rec add_chars i init =
     if i < 0L then init else begin
-      let (c, s') =
-        match s with [] -> (0L, []) | c::s' -> (c, s') in
-      add_chars (Int64.pred i) s' (Init_single (intconst c IInt) :: init)
+      let c = if i < len then a.(Int64.to_int i) else 0L in
+      add_chars (Int64.pred i) (Init_single (intconst c IInt) :: init)
     end in
-  Init_array (add_chars (Int64.pred size) (List.rev s) [])
+  Init_array (add_chars (Int64.pred size) [])
 
 let check_init_type loc env a ty =
   if wrap2 valid_assignment loc env a ty then ()
@@ -975,7 +986,7 @@ module I = struct
                  if fld.fld_name = fld1.fld_name
                  then i
                  else default_init env fld1.fld_typ)
-        end 
+        end
     | (TStruct _ | TUnion _), Init_single a ->
         (* This is a previous whole-struct initialization that we
            are going to overwrite.  Revert to the default initializer. *)
@@ -988,7 +999,7 @@ module I = struct
   let index env (z, i as zi) n =
     match unroll env (typeof zi), i with
     | TArray(ty, sz, _), Init_array il ->
-        if n >= 0L && index_below n sz then begin 
+        if n >= 0L && index_below n sz then begin
           let dfl = default_init env ty in
           let rec loop p before after =
             if p = n then
@@ -1042,7 +1053,7 @@ end
 
 let rec elab_designator loc env zi desig =
   match desig with
-  | [] -> 
+  | [] ->
       zi
   | INFIELD_INIT name :: desig' ->
       begin match I.member env zi name with
@@ -1101,7 +1112,7 @@ let rec elab_list zi il first =
 and elab_item zi item il =
   let ty = I.typeof zi in
   match item, unroll env ty with
-  (* Special case char array = "string literal" 
+  (* Special case char array = "string literal"
                or wchar array = L"wide string literal" *)
   | (SINGLE_INIT (CONSTANT (CONST_STRING(w, s)))
      | COMPOUND_INIT [_, SINGLE_INIT(CONSTANT (CONST_STRING(w, s)))]),
@@ -1312,7 +1323,7 @@ let elab_expr loc env a =
             let ty = TFun(TInt(IInt, []), None, false, []) in
             (* Emit an extern declaration for it *)
             let id = Env.fresh_ident n in
-            emit_elab loc (Gdecl(Storage_extern, id, ty, None));
+            emit_elab env loc (Gdecl(Storage_extern, id, ty, None));
             { edesc = EVar id; etyp = ty }
         | _ -> elab a1 in
       let bl = List.map elab al in
@@ -1735,8 +1746,8 @@ let elab_expr loc env a =
     match args, params with
     | [], [] -> []
     | [], _::_ -> err "not enough arguments in function call"; []
-    | _::_, [] -> 
-        if vararg 
+    | _::_, [] ->
+        if vararg
         then args
         else (err "too many arguments in function call"; args)
     | arg1 :: argl, (_, ty_p) :: paraml ->
@@ -1771,7 +1782,7 @@ let elab_for_expr loc env = function
 
 (* Handling of __func__ (section 6.4.2.2) *)
 
-let __func__type_and_init s = 
+let __func__type_and_init s =
   (TArray(TInt(IChar, [AConst]), Some(Int64.of_int (String.length s + 1)), []),
    init_char_array_string None s)
 
@@ -1784,13 +1795,21 @@ let enter_typedefs loc env sto dl =
   List.fold_left (fun env (s, ty, init) ->
     if init <> NO_INIT then
       error loc "initializer in typedef";
-    if redef Env.lookup_typedef env s then
-      error loc "redefinition of typedef '%s'" s;
-    if redef Env.lookup_ident env s then
-      error loc "redefinition of identifier '%s' as different kind of symbol" s;
-    let (id, env') = Env.enter_typedef env s ty in
-    emit_elab loc (Gtypedef(id, ty));
-    env') env dl
+    match previous_def Env.lookup_typedef env s with
+    | Some (s',ty') ->
+        if equal_types env ty ty' then begin
+          warning loc "redefinition of typedef '%s'" s;
+          env
+        end else begin
+          error loc "redefinition of typedef '%s' with different type" s;
+          env
+        end
+    | None ->
+        if redef Env.lookup_ident env s then
+          error loc "redefinition of identifier '%s' as different kind of symbol" s;
+        let (id, env') = Env.enter_typedef env s ty in
+        emit_elab env loc (Gtypedef(id, ty));
+        env') env dl
 
 let enter_or_refine_ident local loc env s sto ty =
   if redef Env.lookup_typedef env s then
@@ -1865,26 +1884,76 @@ let enter_decdefs local loc env sto dl =
       ((sto', id, ty', init') :: decls, env2)
     else begin
       (* Global definition *)
-      emit_elab loc (Gdecl(sto', id, ty', init'));
+      emit_elab env2 loc (Gdecl(sto', id, ty', init'));
       (decls, env2)
     end in
   let (decls, env') = List.fold_left enter_decdef ([], env) dl in
   (List.rev decls, env')
 
-let elab_fundef env spec name body loc =
-  let (s, sto, inline, ty, env1) = elab_name env spec name in
+let elab_fundef env spec name defs body loc =
+  let (s, sto, inline, ty, kr_params, env1) = elab_fundef_name env spec name in
   if sto = Storage_register then
-    fatal_error loc "a function definition cannot have 'register' storage class";
-  (* Fix up the type.  We can have params = None but only for an
-     old-style parameterless function "int f() {...}" *)
-  let ty =
-    match ty with
-    | TFun(ty_ret, None, vararg, attr) -> TFun(ty_ret, Some [], vararg, attr)
-    | _ -> ty in
+    fatal_error loc "A function definition cannot have 'register' storage class";
+  begin match kr_params, defs with
+  | None, d::_ ->
+    error (get_definitionloc d)
+      "Old-style parameter declaration in a new-style function definition"
+  | _ -> ()
+  end;
+  let (ty, env1) =
+    match ty, kr_params with
+    | TFun(ty_ret, None, vararg, attr), None ->
+      (TFun(ty_ret, Some [], vararg, attr), env1)
+    | ty, None ->
+      (ty, env1)
+    | TFun(ty_ret, None, false, attr), Some params ->
+      warning loc "Non-prototype, pre-standard function definition.@  Converting to prototype form";
+      (* Check that the parameters have unique names *)
+      List.iter (fun id ->
+        if List.length (List.filter ((=) id) params) > 1 then
+          fatal_error loc "Parameter '%s' appears more than once in function declaration" id)
+        params;
+      (* Check that the declarations only declare parameters *)
+      let extract_name (Init_name(Name(s, dty, attrs, loc') as name, ie)) =
+        if not (List.mem s params) then
+          error loc' "Declaration of '%s' which is not a function parameter" s;
+        if ie <> NO_INIT then
+          error loc' "Illegal initialization of function parameter '%s'" s;
+        name
+      in
+      (* Convert old-style K&R function definition to modern prototyped form *)
+      let elab_kr_param_def env = function
+      | DECDEF((spec', name_init_list), loc') ->
+          let name_list = List.map extract_name name_init_list in
+          let (paramsenv, sto) = elab_name_group loc' env (spec', name_list) in
+          if sto <> Storage_default && sto <> Storage_register then
+            error loc' "'extern' or 'static' storage not supported for function parameter";
+          paramsenv
+      | d ->
+          (* Should never be produced by the parser *)
+          fatal_error (get_definitionloc d)
+                      "Illegal declaration of function parameter" in
+      let (kr_params_defs, env1) = mmap elab_kr_param_def env1 defs in
+      let kr_params_defs = List.concat kr_params_defs in
+      let rec search_param_type param =
+        match List.filter (fun (p, _) -> p = param) kr_params_defs with
+        | [] ->
+          (* Parameter is not declared, defaults to "int" in ISO C90,
+             is an error in ISO C99.  Just emit a warning. *)
+          warning loc "Type of '%s' defaults to 'int'" param;
+          (Env.fresh_ident param, TInt (IInt, []))
+        | (_,ty)::q ->
+          if q <> [] then error loc "Parameter '%s' defined more than once" param;
+          (Env.fresh_ident param, argument_conversion env1 ty)
+      in
+      let params' = List.map search_param_type params in
+      (TFun(ty_ret, Some params', false, attr), env1)
+    | _, Some params -> assert false
+  in
   (* Extract info from type *)
   let (ty_ret, params, vararg, attr) =
     match ty with
-    | TFun(ty_ret, Some params, vararg, attr) -> 
+    | TFun(ty_ret, Some params, vararg, attr) ->
          if wrap incomplete_type loc env1 ty_ret && not (is_void_type env ty_ret) then
            fatal_error loc "return type is an incomplete type";
         (ty_ret, params, vararg, attr)
@@ -1899,7 +1968,7 @@ let elab_fundef env spec name body loc =
   let (func_ty, func_init) = __func__type_and_init s in
   let (func_id, _, env3,func_ty) =
     enter_or_refine_ident true loc env2 "__func__" Storage_static func_ty in
-  emit_elab loc (Gdecl(Storage_static, func_id, func_ty, Some func_init));
+  emit_elab ~enter:false env3 loc (Gdecl(Storage_static, func_id, func_ty, Some func_init));
   (* Elaborate function body *)
   let body' = !elab_funbody_f ty_ret env3 body in
   (* Special treatment of the "main" function *)
@@ -1925,69 +1994,22 @@ let elab_fundef env spec name body loc =
       fd_vararg = vararg;
       fd_locals = [];
       fd_body = body'' } in
-  emit_elab loc (Gfundef fn);
+  emit_elab env1 loc (Gfundef fn);
   env1
-
-let elab_kr_fundef env spec name params defs body loc =
-  warning loc "Non-prototype, pre-standard function definition.@  Converting to prototype form";
-  (* Check that the declarations only declare parameters *)
-  let check_one_decl (Init_name(Name(s, dty, attrs, loc'), ie)) =
-    if not (List.mem s params) then
-      error loc' "Declaration of '%s' which is not a function parameter" s;
-    if ie <> NO_INIT then
-      error loc' "Illegal initialization of function parameter '%s'" s in
-  let check_decl = function
-  | DECDEF((spec', name_init_list), loc') ->
-      List.iter check_one_decl name_init_list
-  | d ->
-      (* Should never be produced by the parser *)
-      fatal_error (get_definitionloc d)
-                  "Illegal declaration of function parameter" in
-  List.iter check_decl defs;
-  (* Convert old-style K&R function definition to modern prototyped form *)
-  let rec convert_param param = function
-  | [] ->
-      (* Parameter is not declared, defaults to "int" in ISO C90,
-         is an error in ISO C99.  Just emit a warning. *)
-      warning loc "Type of '%s' defaults to 'int'" param;
-      PARAM([SpecType Tint], Some param, JUSTBASE, [], loc)
-  | DECDEF((spec', name_init_list), loc') :: defs ->
-      let rec convert = function
-        | [] -> convert_param param defs
-        | Init_name(Name(s, dty, attrs, loc''), ie) :: l ->
-            if s = param
-            then PARAM(spec', Some param, dty, attrs, loc'')
-            else convert l
-      in convert name_init_list
-  | _ ->
-      assert false (* checked earlier *) in
-  let params' =
-    List.map (fun p -> convert_param p defs) params in
-  let name' =
-    let (Name(s, dty, attr, loc')) = name in
-    Name(s, append_decltype dty (PROTO(JUSTBASE, (params', false))),
-         attr, loc') in
-  (* Elaborate the prototyped form *)
-  elab_fundef env spec name' body loc
 
 let rec elab_definition (local: bool) (env: Env.t) (def: Cabs.definition)
                     : decl list * Env.t =
   match def with
   (* "int f(int x) { ... }" *)
-  | FUNDEF(spec, name, body, loc) ->
-      if local then error loc "local definition of a function";
-      let env1 = elab_fundef env spec name body loc in
-      ([], env1)
-
   (* "int f(x, y) double y; { ... }" *)
-  | KRFUNDEF(spec, name, params, defs, body, loc) ->
+  | FUNDEF(spec, name, defs, body, loc) ->
       if local then error loc "local definition of a function";
-      let env1 = elab_kr_fundef env spec name params defs body loc in
+      let env1 = elab_fundef env spec name defs body loc in
       ([], env1)
 
   (* "int x = 12, y[10], *z" *)
   | DECDEF(init_name_group, loc) ->
-      let ((dl, env1), sto, tydef) = 
+      let ((dl, env1), sto, tydef) =
         elab_init_name_group loc env init_name_group in
       if tydef then
         let env2 = enter_typedefs loc env1 sto dl
@@ -1997,7 +2019,7 @@ let rec elab_definition (local: bool) (env: Env.t) (def: Cabs.definition)
 
   (* pragma *)
   | PRAGMA(s, loc) ->
-      emit_elab loc (Gpragma s);
+      emit_elab env loc (Gpragma s);
       ([], env)
 
 and elab_definitions local env = function
@@ -2091,7 +2113,7 @@ let rec elab_stmt env ctx s =
       if not (is_scalar_type env a'.etyp) then
         error loc "the condition of 'if' does not have scalar type";
       let s1' = elab_stmt env ctx s1 in
-      let s2' = 
+      let s2' =
         match s2 with
           | None -> sskip
           | Some s2 -> elab_stmt env ctx s2
@@ -2124,12 +2146,12 @@ let rec elab_stmt env ctx s =
         | Some (FC_DECL def) ->
             let (dcl, env') = elab_definition true (Env.new_scope env) def in
             let loc = elab_loc (get_definitionloc def) in
-            (sskip, env', 
+            (sskip, env',
              Some(List.map (fun d -> {sdesc = Sdecl d; sloc = loc}) dcl)) in
       let a2' =
         match a2 with
           | None -> intconst 1L IInt
-          | Some a2 -> elab_expr loc env' a2 
+          | Some a2 -> elab_expr loc env' a2
       in
       if not (is_scalar_type env' a2'.etyp) then
         error loc "the condition of 'for' does not have scalar type";
@@ -2224,7 +2246,9 @@ and elab_block_body env ctx sl =
   | DEFINITION def :: sl1 ->
       let (dcl, env') = elab_definition true env def in
       let loc = elab_loc (get_definitionloc def) in
-      List.map (fun d -> {sdesc = Sdecl d; sloc = loc}) dcl
+      List.map (fun ((sto,id,ty,_) as d) ->
+        Debug.insert_local_declaration sto id ty loc;
+        {sdesc = Sdecl d; sloc = loc}) dcl
       @ elab_block_body env' ctx sl1
   | s :: sl1 ->
       let s' = elab_stmt env ctx s in
@@ -2250,20 +2274,3 @@ let elab_file prog =
   reset();
   ignore (elab_definitions false (Builtins.environment()) prog);
   elaborated_program()
-(*
-  let rec inf = Datatypes.S inf in
-  let ast:Cabs.definition list =
-    Obj.magic
-      (match Parser.translation_unit_file inf (Lexer.tokens_stream lb) with
-         | Parser.Parser.Inter.Fail_pr ->
-             (* Theoretically impossible : implies inconsistencies
-                between grammars. *)
-             Cerrors.fatal_error "Internal error while parsing"
-         | Parser.Parser.Inter.Timeout_pr -> assert false
-         | Parser.Parser.Inter.Parsed_pr (ast, _ ) -> ast)
-  in
-  reset();
-  ignore (elab_definitions false (Builtins.environment()) ast);
-  elaborated_program()
-*)
-

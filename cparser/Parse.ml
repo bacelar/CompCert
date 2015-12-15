@@ -24,12 +24,7 @@ let transform_program t p name =
   (run_pass Unblock.program 'b'
   (run_pass Bitfields.program 'f'
   p)))) in
-  let debug = 
-    if !Clflags.option_g && Configuration.advanced_debug then
-      Some (CtoDwarf.program_to_dwarf p p1 name)
-    else
-      None in
-  (Rename.program p1 (Filename.chop_suffix name ".c")),debug
+  (Rename.program p1 (Filename.chop_suffix name ".c"))
 
 let parse_transformations s =
   let t = ref CharSet.empty in
@@ -43,18 +38,35 @@ let parse_transformations s =
     s;
   !t
 
+let read_file sourcefile =
+  let ic = open_in_bin sourcefile in
+  let n = in_channel_length ic in
+  let text = really_input_string ic n in
+  close_in ic;
+  text
+
 let preprocessed_file transfs name sourcefile =
   Cerrors.reset();
-  let ic = open_in sourcefile in
-  let p,d =
+  (* Reading the whole file at once may seem costly, but seems to be
+     the simplest / most robust way of accessing the text underlying
+     a range of positions. This is used when printing an error message.
+     Plus, I note that reading the whole file into memory leads to a
+     speed increase: "make -C test" speeds up by 3 seconds out of 40
+     on my machine. *)
+  let text = read_file sourcefile in
+  let p =
     try
       let t = parse_transformations transfs in
-      let lb = Lexer.init name ic in
       let rec inf = Datatypes.S inf in
       let ast : Cabs.definition list =
         Obj.magic
-          (match Timing.time2 "Parsing"
-                 Parser.translation_unit_file inf (Lexer.tokens_stream lb) with
+          (match Timing.time "Parsing"
+              (* The call to Lexer.tokens_stream results in the pre
+                 parsing of the entire file. This is non-negligeabe,
+                 so we cannot use Timing.time2 *)
+              (fun () ->
+                Parser.translation_unit_file inf (Lexer.tokens_stream name text)) ()
+           with
              | Parser.Parser.Inter.Fail_pr ->
                  (* Theoretically impossible : implies inconsistencies
                     between grammars. *)
@@ -65,6 +77,5 @@ let preprocessed_file transfs name sourcefile =
       Timing.time2 "Emulations" transform_program t p1 name
     with
     | Cerrors.Abort ->
-        [],None in
-  close_in ic;
-  if Cerrors.check_errors() then None,None else Some p,d
+        [] in
+  if Cerrors.check_errors() then None else Some p
